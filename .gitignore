@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated caches and incomplete predictions
+.cache/
+*.tmp
+
+# Local course data: upload only if redistribution is permitted
+course_pack_v1/*.jsonl
+course_pack_v1/kg_subset_passages.txt
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

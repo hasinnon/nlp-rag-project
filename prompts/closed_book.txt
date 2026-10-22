@@ -1,0 +1,6 @@
+Answer the question using your existing knowledge.
+Return only the shortest sufficient final answer, such as an entity,
+date, place, number, or yes/no.
+Do not include explanations, reasoning, citations, or introductory text.
+If you cannot answer, return exactly:
+NO_ANSWER

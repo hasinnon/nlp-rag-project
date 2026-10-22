@@ -1,0 +1,15 @@
+# run_config.yaml -- one per submitted run, next to its predictions.jsonl.
+system_name: dense_rag              # your own name for this system
+phase: 1
+split: hidden                       # dev or hidden
+description: "bge-small dense retrieval, top-5 passages, strict answer prompt"
+models:                             # fixed for the whole project (declare once in Phase 1)
+  llm: {name: Qwen/Qwen3-8B, where: "Kaggle T4, vLLM, 4-bit AWQ", temperature: 0}
+  embedder: BAAI/bge-small-en-v1.5
+  reranker: null
+settings:                           # anything that defines this run
+  retrieval: {unit: passage, k: 5}
+  max_context_tokens: 1800
+  prompt_file: prompts/strict.txt
+command: "python src/run.py --config configs/dense.yaml --split hidden"
+date: 2026-11-10
