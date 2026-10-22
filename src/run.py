@@ -1,480 +1,623 @@
-"""Run closed-book, BM25, dense, or hybrid QA baselines."""
+"""Phase 1: closed-book, dense RAG, and oracle-context evaluation."""
 
 import argparse
-import hashlib
-import importlib.metadata
+import gc
+import importlib.util
 import json
+import math
 import random
 import re
-from datetime import datetime, timezone
+import string
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import torch
 import yaml
-from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
+from tqdm import tqdm
 
 
-ROOT = Path(__file__).resolve().parents[1]
-METHODS = ("closed_book", "bm25", "dense", "hybrid")
+METHODS = ("closed_book", "dense", "oracle_context")
+KS = (2, 5, 10)
 
+SYSTEM_PROMPT = (
+    "Answer the question with only a short final answer: "
+    "an entity, place, date, number, or yes/no. "
+    "Do not provide explanations or reasoning."
+)
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 def read_jsonl(path):
-    rows = []
-    with Path(path).open(encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}: invalid JSON at line {number}") from exc
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}: line {number} must be an object")
-            rows.append(row)
-    return rows
+    """Read non-empty JSONL lines."""
+    with open(path, encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def write_jsonl_row(file, row):
+    """Write one prediction and flush it to disk."""
+    file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    file.flush()
 
 
-def document_text(doc):
-    return f"{doc['title']}\n{doc['text']}"
+def set_seed(seed):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def tokenize(text):
-    return re.findall(r"\w+", text.lower())
+# ---------------------------------------------------------------------------
+# Exact dense retrieval
+# ---------------------------------------------------------------------------
 
+class DenseRetriever:
+    """Search all normalized document vectors using cosine similarity."""
 
-def top_indices(scores, k):
-    # Stable sorting gives deterministic ordering for ties.
-    return np.argsort(-np.asarray(scores), kind="stable")[:k].tolist()
+    def __init__(self, corpus, model_name, batch_size):
+        self.doc_ids = [doc["doc_id"] for doc in corpus]
 
+        # CPU embedding keeps GPU memory available for the language model.
+        self.encoder = SentenceTransformer(model_name, device="cpu")
 
-def rrf_scores(rankings, size, constant=60):
-    scores = np.zeros(size, dtype=np.float64)
-    for ranking in rankings:
-        for rank, index in enumerate(ranking, 1):
-            scores[index] += 1.0 / (constant + rank)
-    return scores
+        texts = [
+            f"{doc['title']}\n{doc['text']}"
+            for doc in corpus
+        ]
 
-
-def validate_inputs(corpus, questions):
-    if not corpus or not questions:
-        raise ValueError("Corpus and question split must not be empty.")
-
-    for doc in corpus:
-        for field in ("doc_id", "title", "text"):
-            if not isinstance(doc.get(field), str):
-                raise ValueError(f"Invalid corpus field: {field}")
-
-    for question in questions:
-        for field in ("qid", "question"):
-            if not isinstance(question.get(field), str):
-                raise ValueError(f"Invalid question field: {field}")
-
-    if len({d["doc_id"] for d in corpus}) != len(corpus):
-        raise ValueError("Duplicate document IDs in corpus.")
-    if len({q["qid"] for q in questions}) != len(questions):
-        raise ValueError("Duplicate question IDs in question split.")
-
-
-class Retriever:
-    def __init__(self, corpus, config, method, corpus_hash, cache_dir):
-        self.corpus = corpus
-        self.method = method
-        self.config = config
-        self.bm25 = None
-        self.embedder = None
-        self.embeddings = None
-
-        if method in ("bm25", "hybrid"):
-            tokenized = [tokenize(document_text(d)) for d in corpus]
-            if not any(tokenized):
-                raise ValueError("Corpus has no indexable tokens.")
-            self.bm25 = BM25Okapi(tokenized)
-
-        if method in ("dense", "hybrid"):
-            from sentence_transformers import SentenceTransformer
-
-            self.embedder = SentenceTransformer(
-                config["models"]["embedder"],
-                device=config["retrieval"]["embedding_device"],
-            )
-
-            # Corpus text, embedding model, and encoding policy define the cache.
-            identity = {
-                "corpus_sha256": corpus_hash,
-                "model": config["models"]["embedder"],
-                "encoding": "title-newline-text;normalized;v1",
-                "sentence_transformers": importlib.metadata.version(
-                    "sentence-transformers"
-                ),
-            }
-            key = hashlib.sha256(
-                json.dumps(identity, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-
-            cache_dir = Path(cache_dir)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_path = cache_dir / f"{key}.npy"
-
-            if cache_path.exists():
-                self.embeddings = np.load(cache_path, allow_pickle=False)
-            else:
-                self.embeddings = self.embedder.encode(
-                    [document_text(d) for d in corpus],
-                    batch_size=config["retrieval"]["embedding_batch_size"],
-                    normalize_embeddings=True,
-                    convert_to_numpy=True,
-                    show_progress_bar=True,
-                )
-                np.save(cache_path, self.embeddings)
-
-            if self.embeddings.shape[0] != len(corpus):
-                raise ValueError("Embedding cache does not match corpus size.")
-
-    def retrieve(self, question, k):
-        if self.method == "closed_book":
-            return []
-
-        k = min(k, len(self.corpus))
-        rankings = []
-
-        if self.bm25 is not None:
-            scores = self.bm25.get_scores(tokenize(question))
-            rankings.append(top_indices(scores, len(self.corpus)))
-
-        if self.embedder is not None:
-            prefix = self.config["retrieval"].get("query_prefix", "")
-            query = self.embedder.encode(
-                prefix + question,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-            )
-            scores = self.embeddings @ query
-            rankings.append(top_indices(scores, len(self.corpus)))
-
-        if self.method == "hybrid":
-            scores = rrf_scores(
-                rankings,
-                len(self.corpus),
-                self.config["retrieval"]["rrf_k"],
-            )
-            indices = top_indices(scores, k)
-        else:
-            indices = rankings[0][:k]
-
-        return [self.corpus[i]["doc_id"] for i in indices]
-
-
-class Generator:
-    def __init__(self, config, method):
-        import torch
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            BitsAndBytesConfig,
-            set_seed,
+        self.embeddings = self.encoder.encode(
+            texts,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=True,
         )
 
-        set_seed(config["seed"])
-        self.torch = torch
-        self.settings = config["generation"]
-        model_name = config["models"]["llm"]
+    def dense_search(self, question, k, exclude_ids=frozenset()):
+        """Return the top-k document IDs, excluding masked documents."""
+        query = self.encoder.encode(
+            [question],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )[0]
 
-        if self.settings["load_in_4bit"] and not torch.cuda.is_available():
-            raise RuntimeError(
-                "4-bit mode requires a supported GPU environment. "
-                "Enable a Kaggle GPU, or set load_in_4bit: false."
-            )
+        # Dot product equals cosine similarity for normalized vectors.
+        scores = self.embeddings @ query
+
+        # Remove excluded documents before ranking.
+        allowed = np.array([
+            index
+            for index, doc_id in enumerate(self.doc_ids)
+            if doc_id not in exclude_ids
+        ], dtype=np.int64)
+
+        if len(allowed) == 0:
+            return []
+
+        # Stable sorting makes equal-score ordering reproducible.
+        order = np.argsort(-scores[allowed], kind="stable")
+        selected = allowed[order[:k]]
+
+        return [self.doc_ids[index] for index in selected]
+
+
+# ---------------------------------------------------------------------------
+# Answer generation
+# ---------------------------------------------------------------------------
+
+class AnswerGenerator:
+    """Generate short answers using one shared language model."""
+
+    def __init__(self, model_name, max_input_tokens, max_new_tokens):
+        self.model_name = model_name
+        self.max_input_tokens = max_input_tokens
+        self.max_new_tokens = max_new_tokens
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        kwargs = {"device_map": "auto"}
-        if self.settings["load_in_4bit"]:
-            kwargs["quantization_config"] = BitsAndBytesConfig(
+        model_kwargs = {}
+
+        if torch.cuda.is_available():
+            # Quantize the model to reduce memory use on a Kaggle T4.
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
             )
+            model_kwargs["device_map"] = {"": 0}
         else:
-            kwargs["torch_dtype"] = (
-                torch.float16 if torch.cuda.is_available() else torch.float32
-            )
+            model_kwargs["torch_dtype"] = torch.float32
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            **model_kwargs,
+        )
         self.model.eval()
 
-        max_positions = getattr(
+        context_limit = getattr(
             self.model.config, "max_position_embeddings", None
         )
-        total_tokens = (
-            self.settings["max_input_tokens"] + self.settings["max_new_tokens"]
-        )
-        if max_positions is not None and total_tokens > max_positions:
-            raise ValueError("Configured input + output exceeds model context.")
 
-        prompt_key = "closed_book" if method == "closed_book" else "rag"
-        prompt_path = ROOT / config["prompts"][prompt_key]
-        self.system_prompt = prompt_path.read_text(encoding="utf-8")
+        if context_limit is not None:
+            if max_input_tokens + max_new_tokens > context_limit:
+                raise ValueError(
+                    "Input and generation budgets exceed the model context."
+                )
 
-    def render(self, question, blocks):
-        if blocks:
+    def render_prompt(self, question, context):
+        """Apply the model's chat template."""
+        if context:
             user_text = (
-                "Passages:\n\n"
-                + "\n\n".join(blocks)
-                + f"\n\nQuestion: {question}"
+                "Use the following evidence to answer the question.\n\n"
+                f"Evidence:\n{context}\n\n"
+                f"Question: {question}"
             )
         else:
             user_text = f"Question: {question}"
 
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ]
+
+        template_kwargs = {}
+
+        # Qwen3 supports disabling thinking for short-answer evaluation.
+        if "qwen3" in self.model_name.lower():
+            template_kwargs["enable_thinking"] = False
+
         return self.tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_text},
-            ],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
-        )
-
-    def token_count(self, prompt):
-        return len(
-            self.tokenizer.encode(prompt, add_special_tokens=False)
+            **template_kwargs,
         )
 
     def build_prompt(self, question, documents):
-        limit = self.settings["max_input_tokens"]
-        if self.token_count(self.render(question, [])) > limit:
-            raise ValueError("Question and instructions exceed input budget.")
+        """Allocate context space equally across the selected documents."""
+        if not documents:
+            return self.render_prompt(question, "")
 
-        blocks = []
-        for doc in documents:
-            header = f"[{doc['doc_id']}] {doc['title']}\n"
-            full_block = header + doc["text"]
+        # Include document headers when estimating the fixed prompt cost.
+        headers = [
+            f"[{doc['doc_id']}] {doc['title']}"
+            for doc in documents
+        ]
+        empty_context = "\n\n".join(headers)
+        base_prompt = self.render_prompt(question, empty_context)
+        base_size = len(
+            self.tokenizer.encode(base_prompt, add_special_tokens=False)
+        )
 
-            candidate = self.render(question, blocks + [full_block])
-            if self.token_count(candidate) <= limit:
-                blocks.append(full_block)
-                continue
+        # Reserve a small margin for tokenization boundary differences.
+        available = self.max_input_tokens - base_size - 128
 
-            # Fit a prefix of the final passage while preserving the question.
-            text_tokens = self.tokenizer.encode(
-                doc["text"], add_special_tokens=False
+        if available < len(documents):
+            raise ValueError(
+                "The input budget is too small for the selected documents."
             )
-            low, high = 0, len(text_tokens)
-            while low < high:
-                middle = (low + high + 1) // 2
-                prefix = self.tokenizer.decode(
-                    text_tokens[:middle], skip_special_tokens=True
-                )
-                candidate = self.render(question, blocks + [header + prefix])
-                if self.token_count(candidate) <= limit:
-                    low = middle
-                else:
-                    high = middle - 1
 
-            if low > 0:
-                prefix = self.tokenizer.decode(
-                    text_tokens[:low], skip_special_tokens=True
-                )
-                blocks.append(header + prefix)
-            break
+        tokens_per_doc = available // len(documents)
+        parts = []
 
-        return self.render(question, blocks)
+        for doc, header in zip(documents, headers):
+            text_ids = self.tokenizer.encode(
+                doc["text"],
+                add_special_tokens=False,
+            )
+            text = self.tokenizer.decode(
+                text_ids[:tokens_per_doc],
+                skip_special_tokens=True,
+            )
+            parts.append(f"{header}\n{text}")
+
+        return self.render_prompt(question, "\n\n".join(parts))
 
     def answer(self, question, documents):
+        """Generate only tokens following the input prompt."""
         prompt = self.build_prompt(question, documents)
+
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
             add_special_tokens=False,
         )
-        device = self.model.get_input_embeddings().weight.device
-        inputs = {key: value.to(device) for key, value in inputs.items()}
 
-        with self.torch.inference_mode():
+        if inputs["input_ids"].shape[1] > self.max_input_tokens:
+            raise ValueError(
+                "Prompt exceeds max_input_tokens; increase the input budget."
+            )
+
+        inputs = inputs.to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        with torch.inference_mode():
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=self.settings["max_new_tokens"],
+                max_new_tokens=self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
-        generated = output[0, inputs["input_ids"].shape[1]:]
-        answer = self.tokenizer.decode(
-            generated, skip_special_tokens=True
+        generated = output[0, input_length:]
+
+        return self.tokenizer.decode(
+            generated,
+            skip_special_tokens=True,
         ).strip()
 
-        abstained = not answer or answer == "NO_ANSWER"
-        return ("" if abstained else answer), abstained
 
+# ---------------------------------------------------------------------------
+# Handwritten metrics
+# ---------------------------------------------------------------------------
 
-def environment_versions():
-    packages = (
-        "numpy",
-        "PyYAML",
-        "rank-bm25",
-        "torch",
-        "transformers",
-        "sentence-transformers",
-        "accelerate",
-        "bitsandbytes",
+def normalize_answer(text):
+    """Match the answer normalization used by the course scorer."""
+    text = "".join(
+        char for char in text.lower()
+        if char not in string.punctuation
     )
-    versions = {}
-    for name in packages:
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
-    return versions
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    return " ".join(text.split())
+
+
+def token_f1(prediction, reference):
+    """Calculate token-level F1 without a metric library."""
+    pred = normalize_answer(prediction)
+    gold = normalize_answer(reference)
+
+    special_answers = ("yes", "no", "noanswer")
+
+    if (pred in special_answers or gold in special_answers) and pred != gold:
+        return 0.0
+
+    pred_tokens = pred.split()
+    gold_tokens = gold.split()
+
+    overlap = sum(
+        (Counter(pred_tokens) & Counter(gold_tokens)).values()
+    )
+
+    if overlap == 0:
+        return 0.0
+
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(gold_tokens)
+
+    return 2 * precision * recall / (precision + recall)
+
+
+def question_metrics(prediction, label):
+    """Calculate answer and retrieval metrics for one question."""
+    gold_ids = set(label["gold_doc_ids"])
+    ranked = prediction["retrieved"]
+
+    if not gold_ids:
+        raise ValueError("Retrieval evaluation requires gold documents.")
+
+    metrics = {}
+
+    for k in KS:
+        top_ids = set(ranked[:k])
+        metrics[f"recall@{k}"] = len(top_ids & gold_ids) / len(gold_ids)
+        metrics[f"hitall@{k}"] = float(gold_ids <= top_ids)
+
+    metrics["mrr"] = next(
+        (
+            1.0 / rank
+            for rank, doc_id in enumerate(ranked, start=1)
+            if doc_id in gold_ids
+        ),
+        0.0,
+    )
+
+    dcg = sum(
+        1.0 / math.log2(rank + 1)
+        for rank, doc_id in enumerate(ranked[:10], start=1)
+        if doc_id in gold_ids
+    )
+    ideal_dcg = sum(
+        1.0 / math.log2(rank + 1)
+        for rank in range(1, min(len(gold_ids), 10) + 1)
+    )
+    metrics["ndcg@10"] = dcg / ideal_dcg
+
+    answer = prediction["answer"]
+    references = [label["answer"]] + label.get("aliases", [])
+
+    metrics["em"] = (
+        float(any(
+            normalize_answer(answer) == normalize_answer(reference)
+            for reference in references
+        ))
+        if answer else 0.0
+    )
+    metrics["f1"] = (
+        max(token_f1(answer, reference) for reference in references)
+        if answer else 0.0
+    )
+
+    return metrics
+
+
+def evaluate_dev(predictions, labels, score_path, questions, corpus):
+    """Validate predictions and compare handwritten metrics with score.py."""
+    spec = importlib.util.spec_from_file_location(
+        "course_score", score_path
+    )
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load scorer: {score_path}")
+
+    scorer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scorer)
+
+    errors = scorer.validate(
+        predictions,
+        {question["qid"] for question in questions},
+        {doc["doc_id"] for doc in corpus},
+        partial=len(predictions) < len(questions),
+    )
+
+    if errors:
+        raise ValueError("\n".join(errors[:20]))
+
+    rows = []
+    max_difference = 0.0
+
+    for prediction in predictions:
+        label = labels[prediction["qid"]]
+
+        # Compute our metrics independently, then check the staff reference.
+        own = question_metrics(prediction, label)
+        reference = scorer.per_question(prediction, label)
+
+        for name, value in own.items():
+            difference = abs(value - reference[name])
+            max_difference = max(max_difference, difference)
+
+        rows.append(own)
+
+    if max_difference >= 0.001:
+        raise AssertionError(
+            f"Metric mismatch with score.py: {max_difference}"
+        )
+
+    averages = {
+        name: sum(row[name] for row in rows) / len(rows)
+        for name in rows[0]
+    }
+
+    print("\nHandwritten metrics (percent):")
+    for name, value in averages.items():
+        print(f"  {name:12s}: {100 * value:.2f}")
+
+    print(f"Maximum difference from score.py: {max_difference:.8f}")
+
+    return {
+        "n": len(rows),
+        "metrics": averages,
+        "max_difference_from_score_py": max_difference,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Experiment
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser.add_argument("--pack", required=True)
+    parser.add_argument("--method", required=True, choices=METHODS)
+    parser.add_argument("--split", default="dev", choices=("dev", "hidden"))
+    parser.add_argument("--output", required=True)
+
+    parser.add_argument("--llm", default="Qwen/Qwen3-8B")
+    parser.add_argument("--embedder", default="BAAI/bge-small-en-v1.5")
+
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--context-k", type=int, default=5)
+    parser.add_argument("--embedding-batch-size", type=int, default=32)
+
+    parser.add_argument("--max-input-tokens", type=int, default=4096)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Run a small test subset instead of the full split.",
+    )
+    parser.add_argument(
+        "--score-script",
+        default=str(Path(__file__).resolve().with_name("score.py")),
+    )
+
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/base.yaml")
-    parser.add_argument("--pack", default="course_pack_v1")
-    parser.add_argument("--split", choices=("dev", "hidden"), default="dev")
-    parser.add_argument("--method", choices=METHODS, default="bm25")
-    parser.add_argument("--out", required=True, help="Output run directory")
-    parser.add_argument("--cache", default=".cache/embeddings")
-    parser.add_argument("--limit", type=int, help="Dev smoke test only")
-    parser.add_argument(
-        "--retrieval-only",
-        action="store_true",
-        help="Skip LLM; write empty answers for retrieval debugging",
-    )
-    args = parser.parse_args()
+    args = parse_args()
 
-    if args.limit is not None:
-        if args.split != "dev" or args.limit < 1:
-            parser.error("--limit must be positive and is allowed only on dev.")
+    if args.method == "oracle_context" and args.split != "dev":
+        raise ValueError("Oracle-context is only available on dev.")
 
-    if args.retrieval_only and args.method == "closed_book":
-        parser.error("--retrieval-only is not useful with closed_book.")
+    if args.top_k < 10:
+        raise ValueError("Use at least 10 retrieved documents for dense.")
 
-    config_path = Path(args.config)
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    settings = config["retrieval"]
+    if not 1 <= args.context_k <= args.top_k:
+        raise ValueError("context-k must be between 1 and top-k.")
 
-    if not 1 <= settings["context_k"] <= settings["top_k"]:
-        parser.error("Require 1 <= context_k <= top_k.")
-    if settings["rrf_k"] <= 0:
-        parser.error("rrf_k must be positive.")
+    if args.limit is not None and args.limit < 1:
+        raise ValueError("limit must be positive.")
 
-    random.seed(config["seed"])
-    np.random.seed(config["seed"])
+    if args.max_input_tokens < 1 or args.max_new_tokens < 1:
+        raise ValueError("Token budgets must be positive.")
+
+    if args.embedding_batch_size < 1:
+        raise ValueError("Embedding batch size must be positive.")
+
+    set_seed(args.seed)
 
     pack = Path(args.pack)
-    corpus_path = pack / "corpus.jsonl"
-    question_path = pack / f"questions_{args.split}.jsonl"
-
-    corpus = read_jsonl(corpus_path)
-    questions = read_jsonl(question_path)
-    validate_inputs(corpus, questions)
-
-    if args.limit is not None:
-        questions = questions[:args.limit]
-
-    output_dir = Path(args.out)
+    output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    prediction_path = output_dir / "predictions.jsonl"
-    run_config_path = output_dir / "run_config.yaml"
 
-    if prediction_path.exists() or run_config_path.exists():
-        raise FileExistsError("Use a new output directory for each run.")
+    predictions_path = output_dir / "predictions.jsonl"
 
-    corpus_hash = sha256_file(corpus_path)
-    retriever = Retriever(
-        corpus, config, args.method, corpus_hash, args.cache
+    # Prevent accidental replacement of an existing experiment.
+    if predictions_path.exists():
+        raise FileExistsError(
+            f"{predictions_path} already exists. Use a new output folder."
+        )
+
+    corpus = read_jsonl(pack / "corpus.jsonl")
+    all_questions = read_jsonl(pack / f"questions_{args.split}.jsonl")
+    questions = (
+        all_questions[:args.limit]
+        if args.limit is not None else all_questions
     )
-    generator = None if args.retrieval_only else Generator(config, args.method)
-    by_id = {doc["doc_id"]: doc for doc in corpus}
 
-    temporary_path = output_dir / "predictions.jsonl.tmp"
-    with temporary_path.open("w", encoding="utf-8") as handle:
-        for index, question in enumerate(questions, 1):
-            ranked = retriever.retrieve(
-                question["question"], settings["top_k"]
-            )
-            context = [by_id[d] for d in ranked[:settings["context_k"]]]
+    if not questions:
+        raise ValueError("No questions were loaded.")
 
-            if generator is None:
-                answer, abstained = "", True
-            else:
-                answer, abstained = generator.answer(
-                    question["question"], context
-                )
+    documents_by_id = {doc["doc_id"]: doc for doc in corpus}
 
-            row = {
-                "qid": question["qid"],
-                "answer": answer,
-                "retrieved": ranked,
-                "abstained": abstained,
-            }
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            handle.flush()
-            print(f"[{index}/{len(questions)}] {question['qid']}", flush=True)
+    # Hidden labels are never loaded.
+    labels = {}
+    if args.split == "dev":
+        labels = {
+            label["qid"]: label
+            for label in read_jsonl(pack / "labels_dev.jsonl")
+        }
 
-    # Preserve model declarations and actual execution settings.
-    metadata = {
-        "system_name": args.method,
-        "phase": config["phase"],
+        if not Path(args.score_script).is_file():
+            raise FileNotFoundError(args.score_script)
+
+    retriever = None
+
+    if args.method == "dense":
+        retriever = DenseRetriever(
+            corpus,
+            args.embedder,
+            args.embedding_batch_size,
+        )
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    generator = AnswerGenerator(
+        args.llm,
+        args.max_input_tokens,
+        args.max_new_tokens,
+    )
+
+    config = {
+        "method": args.method,
         "split": args.split,
-        "description": config["description"],
-        "models": {
-            "llm": {
-                "name": config["models"]["llm"],
-                "backend": "transformers",
-                "load_in_4bit": config["generation"]["load_in_4bit"],
-                "do_sample": False,
-            },
-            "embedder": config["models"]["embedder"],
-            "reranker": None,
+        "pack": str(pack.resolve()),
+        "llm": args.llm,
+        "quantization": "bitsandbytes_nf4" if torch.cuda.is_available() else None,
+        "embedder": args.embedder if args.method == "dense" else None,
+        "embedding_device": "cpu" if args.method == "dense" else None,
+        "document_format": "title + newline + text",
+        "retrieval": {
+            "type": "exact_cosine" if args.method == "dense" else args.method,
+            "top_k": args.top_k if args.method == "dense" else None,
+            "context_k": args.context_k if args.method == "dense" else None,
         },
-        "settings": config,
-        "execution": {
-            "method": args.method,
-            "retrieval_only": args.retrieval_only,
-            "llm_loaded": generator is not None,
-            "embedder_loaded": retriever.embedder is not None,
-            "n_questions": len(questions),
-            "partial": len(questions) < len(read_jsonl(question_path)),
-            "arguments": vars(args),
+        "max_input_tokens": args.max_input_tokens,
+        "max_new_tokens": args.max_new_tokens,
+        "context_policy": "equal token allocation across selected documents",
+        "do_sample": False,
+        "qwen3_thinking_disabled": "qwen3" in args.llm.lower(),
+        "system_prompt": SYSTEM_PROMPT,
+        "seed": args.seed,
+        "n_questions": len(questions),
+        "partial": len(questions) < len(all_questions),
+        "versions": {
+            "torch": str(torch.__version__),
         },
-        "provenance": {
-            "corpus_sha256": corpus_hash,
-            "questions_sha256": sha256_file(question_path),
-            "config_sha256": sha256_file(config_path),
-            "code_sha256": sha256_file(Path(__file__)),
-            "prompt_sha256": {
-                key: sha256_file(ROOT / path)
-                for key, path in config["prompts"].items()
-            },
-        },
-        "environment": environment_versions(),
-        "date": datetime.now(timezone.utc).isoformat(),
     }
 
-    import shlex
-    import sys
+    with open(output_dir / "run_config.yaml", "w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file, allow_unicode=True, sort_keys=False)
 
-    metadata["command"] = shlex.join([sys.executable, *sys.argv])
-    run_config_path.write_text(
-        yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
-    temporary_path.replace(prediction_path)
-    print(f"Saved predictions: {prediction_path}")
+    predictions = []
+
+    with open(predictions_path, "w", encoding="utf-8") as file:
+        for question in tqdm(questions, desc=args.method):
+            qid = question["qid"]
+
+            if args.method == "closed_book":
+                retrieved = []
+                context_ids = []
+
+            elif args.method == "dense":
+                retrieved = retriever.dense_search(
+                    question["question"],
+                    args.top_k,
+                )
+                context_ids = retrieved[:args.context_k]
+
+            else:
+                # Oracle uses every gold document, not dense context-k.
+                retrieved = list(dict.fromkeys(labels[qid]["gold_doc_ids"]))
+                context_ids = retrieved
+
+            context_documents = [
+                documents_by_id[doc_id]
+                for doc_id in context_ids
+            ]
+
+            answer = generator.answer(
+                question["question"],
+                context_documents,
+            )
+
+            # Only fields allowed by predictions_format.md are written.
+            prediction = {
+                "qid": qid,
+                "answer": answer,
+                "retrieved": retrieved,
+            }
+
+            write_jsonl_row(file, prediction)
+            predictions.append(prediction)
+
+    print(f"\nSaved predictions: {predictions_path}")
+
+    if args.split == "dev":
+        metrics = evaluate_dev(
+            predictions,
+            labels,
+            args.score_script,
+            all_questions,
+            corpus,
+        )
+
+        with open(output_dir / "metrics.json", "w", encoding="utf-8") as file:
+            json.dump(metrics, file, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
