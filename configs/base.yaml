@@ -4,13 +4,13 @@ description: "Initial closed-book and passage-level RAG baselines"
 seed: 42
 
 models:
-  llm: Qwen/Qwen2.5-3B-Instruct
+  llm: Qwen/Qwen3-4B
   embedder: BAAI/bge-small-en-v1.5
 
 generation:
   load_in_4bit: true
-  max_input_tokens: 3072
-  max_new_tokens: 64
+  max_input_tokens: 4096
+  max_new_tokens: 128
 
 retrieval:
   top_k: 10

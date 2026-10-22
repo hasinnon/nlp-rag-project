@@ -243,6 +243,7 @@ class Generator:
             ],
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
 
     def token_count(self, prompt):
